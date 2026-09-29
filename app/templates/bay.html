@@ -6,13 +6,13 @@
   x-init="init()"
 >
   <div class="chips" role="toolbar" aria-label="工坊筛选">
-    <button type="button" class="chip" :class="{ on: filterWs === null }" @click="setFilter(null)">全部缸位</button>
+    <button type="button" class="chip" :class="{ on: (pendingFilter ?? filterWs) === null }" @click="setFilter(null)">全部缸位</button>
     <template x-for="w in workshops" :key="w.id">
       <button
         type="button"
         class="chip"
-        :class="{ on: filterWs === w.name }"
-        @click="setFilter(w.name)"
+        :class="{ on: (pendingFilter ?? filterWs) === w.id }"
+        @click="setFilter(w.id)"
         x-text="w.name + ' (' + (w.badge || 0) + ')'"
       ></button>
     </template>
@@ -21,6 +21,13 @@
   {% if error %}
   <div class="error-box">{{ error }}</div>
   {% endif %}
+  <div class="error-box" x-show="refreshError" x-cloak>
+    工坊缸位局部刷新失败，已保留当前缸位列表，可
+    <button type="button" @click="setFilter(filterWs)">重试</button>
+    或
+    <button type="button" @click="reloadPage()">整页刷新</button>
+    （无需重新登录）。
+  </div>
 
   <div class="bay-scroll" role="list">
     <template x-for="v in filteredVats()" :key="v.id">
@@ -138,42 +145,100 @@
     return {
       workshops: {{ workshops | tojson }},
       vats: {{ vats | tojson }},
-      filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
-      selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      // 与后端同一主键：int 工坊 id 或 null（全部），名称一律不参与过滤
+      filterWs: {{ filter_workshop | tojson }},
+      selectedId: {{ selected_vat | tojson }},
+      refreshError: false,
+      loading: false,
+      reqSeq: 0,
+      pendingFilter: null,
       init() {
         const params = new URLSearchParams(window.location.search);
-        if (params.has('workshop') && this.filterWs === null) {
-          const w = parseInt(params.get('workshop'), 10);
-          if (!isNaN(w)) this.filterWs = w;
-        }
         if (params.has('vat') && this.selectedId === null) {
           const v = parseInt(params.get('vat'), 10);
           if (!isNaN(v)) this.selectedId = v;
         }
+        // URL 里若是名称等非法 token，后端已按“全部”渲染，这里同步掉脏参数
+        if (params.get('workshop') && this.filterWs === null) {
+          const url = new URL(window.location.href);
+          url.searchParams.delete('workshop');
+          history.replaceState(null, '', url.pathname + url.search);
+        }
+        // 后台静默局部刷新；任何失败只提示、不清列表、不清会话
+        this.pollTimer = setInterval(() => this.loadScope(this.filterWs, false), 30000);
       },
       setFilter(id) {
-        this.filterWs = id;
-        const still = this.filteredVats().some(v => v.id === this.selectedId);
-        if (!still) this.selectedId = null;
+        const target = id === null ? null : id;
+        // 只先切换 chip 高亮（pendingFilter）；列表等服务端范围结果回来再换，
+        // 避免切坊请求在途时旧数据按新坊过滤而闪出空白
+        this.pendingFilter = target;
+        this.refreshError = false;
+        this.loadScope(target, true);
+      },
+      async loadScope(target, showError) {
+        const seq = ++this.reqSeq;
+        const qs = target === null
+          ? ''
+          : '?workshop=' + encodeURIComponent(target);
+        this.loading = true;
+        try {
+          const res = await fetch('/bay/refresh' + qs, {
+            headers: { 'Accept': 'application/json' },
+            credentials: 'same-origin',
+          });
+          if (res.status === 401) {
+            // 仅会话真正失效时才跳登录；普通网络/过滤错误不走这里
+            window.location.assign('/login');
+            return;
+          }
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+          if (seq !== this.reqSeq) return; // 有更新的切坊请求，丢弃过期响应
+          // 范围结果回来后才正式生效；即便返回空也与该坊真实缸数一致
+          this.vats = Array.isArray(data.vats) ? data.vats : [];
+          this.filterWs = data.workshopId ?? null;
+          this.pendingFilter = null;
+          if (data.badges) {
+            this.workshops.forEach(w => {
+              if (data.badges[w.id] !== undefined && data.badges[w.id] !== null) {
+                w.badge = data.badges[w.id];
+              }
+            });
+          }
+          this.refreshError = false;
+          if (!this.filteredVats().some(v => v.id === this.selectedId)) {
+            this.selectedId = null;
+          }
+          this.syncUrl();
+        } catch (err) {
+          if (seq !== this.reqSeq) return;
+          // 切坊失败/过滤异常：高亮与列表都回退到当前生效坊，保留现有缸位，
+          // 页面与还原台继续可用，无需重登
+          this.pendingFilter = null;
+          if (showError) this.refreshError = true;
+        } finally {
+          if (seq === this.reqSeq) this.loading = false;
+        }
+      },
+      reloadPage() {
+        window.location.assign(window.location.pathname + window.location.search);
+      },
+      syncUrl() {
         const url = new URL(window.location.href);
-        if (id === null) url.searchParams.delete('workshop');
-        else url.searchParams.set('workshop', id); // name token
+        if (this.filterWs === null) url.searchParams.delete('workshop');
+        else url.searchParams.set('workshop', this.filterWs);
         if (this.selectedId) url.searchParams.set('vat', this.selectedId);
         else url.searchParams.delete('vat');
         history.replaceState(null, '', url.pathname + url.search);
       },
       filteredVats() {
         if (this.filterWs === null) return this.vats;
-        // 前端按名称模糊，同名坊必串
-        return this.vats.filter(v => v.workshopName === this.filterWs || (v.workshopName || '').includes(this.filterWs));
+        // 只按主键精确匹配；不再做名称模糊，同名坊互不串缸
+        return this.vats.filter(v => v.workshopId === this.filterWs);
       },
       toggle(id) {
         this.selectedId = this.selectedId === id ? null : id;
-        const url = new URL(window.location.href);
-        if (this.selectedId) url.searchParams.set('vat', this.selectedId);
-        else url.searchParams.delete('vat');
-        if (this.filterWs !== null) url.searchParams.set('workshop', this.filterWs);
-        history.replaceState(null, '', url.pathname + url.search);
+        this.syncUrl();
       },
       selected() {
         return this.vats.find(v => v.id === this.selectedId) || null;

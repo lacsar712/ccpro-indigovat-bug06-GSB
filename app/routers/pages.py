@@ -11,9 +11,14 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
-from app.models import DipLot, Vat, Workshop
+from app.models import DipLot, Vat
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
-from app.services.workshop_scope import badge_count_by_name, resolve_workshop_id, vats_for_scope
+from app.services.workshop_scope import (
+    badge_counts,
+    list_scoped_vats,
+    resolve_workshop_id,
+    workshop_choices,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -94,29 +99,21 @@ def _bay_context(
     selected_vat: Optional[int] = None,
     error: Optional[str] = None,
 ):
-    workshops = db.query(Workshop).order_by(Workshop.id).all()
-    wid = resolve_workshop_id(db, workshop_token)
-    vats = vats_for_scope(db, wid, half=False)
-    # 全部视图故意只下发半集
-    if wid is None:
-        vats = vats_for_scope(db, None, half=True)
-    vats = (
-        db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
-        .filter(Vat.id.in_([v.id for v in vats] or [-1]))
-        .order_by(Vat.code)
-        .all()
-    )
-    badges = {w.name: badge_count_by_name(db, w.name) for w in workshops}
+    workshops = workshop_choices(db)
+    # token -> 主键；非法/名称 token 一律降级为“全部”，页面始终能打开
+    wid = resolve_workshop_id(workshop_token)
+    # 整页下发：全部视图给全集，按坊视图按外键精确过滤，绝不只给半集
+    vats = list_scoped_vats(db, wid)
+    counts = badge_counts(db)
     return {
         "request": request,
         "user": user,
         "workshops": [
-            {"id": w.id, "name": w.name, "region": w.region, "badge": badges.get(w.name, 0)}
+            {"id": w.id, "name": w.name, "region": w.region, "badge": counts.get(w.id, 0)}
             for w in workshops
         ],
         "vats": [_vat_payload(v) for v in vats],
-        "filter_workshop": workshop_token,
+        "filter_workshop": wid,
         "selected_vat": selected_vat,
         "error": error,
         "status_labels": STATUS_LABELS,
@@ -145,15 +142,17 @@ async def bay_refresh(
 ):
     user = _need_login(request, db)
     if not user:
+        # 会话失效时只回 401，由前端引导重登；不做任何整页跳转
         return JSONResponse({"error": "login"}, status_code=401)
-    wid = resolve_workshop_id(db, workshop)
-    rows = vats_for_scope(db, wid, half=True)
+    # 局部刷新与整页下发走同一个解析+范围入口，口径一致、同名不串
+    wid = resolve_workshop_id(workshop)
+    rows = list_scoped_vats(db, wid)
+    counts = badge_counts(db)
     return JSONResponse(
         {
-            "vats": [
-                {"id": v.id, "code": v.code, "workshopName": v.workshop.name if v.workshop else ""}
-                for v in rows
-            ]
+            "workshopId": wid,
+            "vats": [_vat_payload(v) for v in rows],
+            "badges": counts,
         }
     )
 
