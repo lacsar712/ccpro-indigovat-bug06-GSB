@@ -11,16 +11,27 @@
       <button
         type="button"
         class="chip"
-        :class="{ on: filterWs === w.name }"
-        @click="setFilter(w.name)"
+        :class="{ on: filterWs === w.id }"
+        @click="setFilter(w.id)"
         x-text="w.name + ' (' + (w.badge || 0) + ')'"
       ></button>
     </template>
+    <button
+      type="button"
+      class="chip"
+      @click="refreshBay()"
+      :disabled="refreshing"
+      x-text="refreshing ? '刷新中…' : '刷新缸位'"
+    ></button>
   </div>
 
   {% if error %}
   <div class="error-box">{{ error }}</div>
   {% endif %}
+  {% if scope_warning %}
+  <div class="error-box" style="background:#eef4f7;color:#2a4554;border-color:#b7cdd0">{{ scope_warning }}</div>
+  {% endif %}
+  <div class="error-box" x-show="refreshError" x-cloak x-text="refreshError"></div>
 
   <div class="bay-scroll" role="list">
     <template x-for="v in filteredVats()" :key="v.id">
@@ -84,7 +95,7 @@
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">登记浸染</h3>
             <form method="post" :action="'/bay/vats/' + selected().id + '/lots'">
-              <input type="hidden" name="workshop" :value="filterWs || ''">
+              <input type="hidden" name="workshop" :value="filterWs === null ? '' : filterWs">
               <label>浸染时间
                 <input type="datetime-local" name="dippedAt" required :value="nowLocal()">
               </label>
@@ -100,7 +111,7 @@
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">改缸状态</h3>
             <form method="post" :action="'/bay/vats/' + selected().id + '/status'">
-              <input type="hidden" name="workshop" :value="filterWs || ''">
+              <input type="hidden" name="workshop" :value="filterWs === null ? '' : filterWs">
               <label>目标状态
                 <select name="status" required :value="selected().status">
                   <option value="idle">闲置</option>
@@ -138,13 +149,21 @@
     return {
       workshops: {{ workshops | tojson }},
       vats: {{ vats | tojson }},
-      filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
+      // 前端过滤键与后端同一个工坊主键：null=全部，数字=Workshop.id。
+      // 经 tojson 渲染（null / 整数），不再内联裸中文名称。
+      filterWs: {{ filter_workshop_id | tojson }},
       selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      refreshing: false,
+      refreshError: '',
       init() {
         const params = new URLSearchParams(window.location.search);
         if (params.has('workshop') && this.filterWs === null) {
-          const w = parseInt(params.get('workshop'), 10);
-          if (!isNaN(w)) this.filterWs = w;
+          const raw = params.get('workshop');
+          // 只承认库内真实存在的工坊主键；名称、模糊串、缺失 id 一律回到全部
+          const w = /^[0-9]+$/.test(raw.trim()) ? parseInt(raw, 10) : NaN;
+          if (!Number.isNaN(w) && this.workshops.some(x => x.id === w)) {
+            this.filterWs = w;
+          }
         }
         if (params.has('vat') && this.selectedId === null) {
           const v = parseInt(params.get('vat'), 10);
@@ -153,19 +172,58 @@
       },
       setFilter(id) {
         this.filterWs = id;
+        this.refreshError = '';
         const still = this.filteredVats().some(v => v.id === this.selectedId);
         if (!still) this.selectedId = null;
         const url = new URL(window.location.href);
         if (id === null) url.searchParams.delete('workshop');
-        else url.searchParams.set('workshop', id); // name token
+        else url.searchParams.set('workshop', id); // 工坊主键，不是名称
         if (this.selectedId) url.searchParams.set('vat', this.selectedId);
         else url.searchParams.delete('vat');
         history.replaceState(null, '', url.pathname + url.search);
       },
       filteredVats() {
         if (this.filterWs === null) return this.vats;
-        // 前端按名称模糊，同名坊必串
-        return this.vats.filter(v => v.workshopName === this.filterWs || (v.workshopName || '').includes(this.filterWs));
+        // 严格按主键相等，不做任何名称/模糊匹配
+        return this.vats.filter(v => v.workshopId === this.filterWs);
+      },
+      async refreshBay() {
+        if (this.refreshing) return;
+        this.refreshing = true;
+        this.refreshError = '';
+        try {
+          const url = new URL('/bay/refresh', window.location.origin);
+          if (this.filterWs !== null) url.searchParams.set('workshop', this.filterWs);
+          const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+          if (res.status === 401) {
+            // 只代表真实的登录失效；筛选非法走 400 分支，绝不到这里
+            this.refreshError = '登录态已失效，请点右上角退出后重新登录。';
+            return;
+          }
+          if (res.status === 400) {
+            // 坊已删除 / token 失效：后端口径是回到全部，前端跟着回全部
+            const data = await res.json().catch(() => ({}));
+            this.refreshError = '工坊筛选无效，已重置为全部缸位。' + (data.message ? '（' + data.message + '）' : '');
+            this.setFilter(null);
+            return;
+          }
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+          // 局部刷新与整页同一字段结构：直接整体替换，失败不清空旧列表
+          this.vats = Array.isArray(data.vats) ? data.vats : [];
+          if (data.badges) {
+            this.workshops = this.workshops.map(w => ({
+              ...w,
+              badge: Number.isInteger(data.badges[w.id]) ? data.badges[w.id] : w.badge,
+            }));
+          }
+          if (!this.vats.some(v => v.id === this.selectedId)) this.selectedId = null;
+        } catch (err) {
+          // 网络/解析异常：保留现有列表与会话，只提示，不白屏、不强制重登
+          this.refreshError = '缸位刷新失败，已保留当前列表，可稍后重试。';
+        } finally {
+          this.refreshing = false;
+        }
       },
       toggle(id) {
         this.selectedId = this.selectedId === id ? null : id;

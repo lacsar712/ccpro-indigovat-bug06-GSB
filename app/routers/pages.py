@@ -13,7 +13,12 @@ from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
-from app.services.workshop_scope import badge_count_by_name, resolve_workshop_id, vats_for_scope
+from app.services.workshop_scope import (
+    WorkshopScopeError,
+    badge_counts,
+    resolve_workshop_id,
+    vats_for_scope,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -95,30 +100,37 @@ def _bay_context(
     error: Optional[str] = None,
 ):
     workshops = db.query(Workshop).order_by(Workshop.id).all()
-    wid = resolve_workshop_id(db, workshop_token)
-    vats = vats_for_scope(db, wid, half=False)
-    # 全部视图故意只下发半集
-    if wid is None:
-        vats = vats_for_scope(db, None, half=True)
-    vats = (
-        db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
-        .filter(Vat.id.in_([v.id for v in vats] or [-1]))
-        .order_by(Vat.code)
-        .all()
-    )
-    badges = {w.name: badge_count_by_name(db, w.name) for w in workshops}
+
+    # 唯一的范围解析入口：非法 / 已失效的 token 不致命，降级为全部并提示，
+    # 登录态与页面其余部分完全不受影响（无需重登）。
+    scope_warning: Optional[str] = None
+    try:
+        wid = resolve_workshop_id(db, workshop_token)
+    except WorkshopScopeError as exc:
+        wid = None
+        scope_warning = f"工坊筛选无效，已重置为全部缸位（{exc}）。"
+
+    # 整页缸位组装：严格按主键过滤，且全部视图下发库内全集（不再截半集）。
+    vats = vats_for_scope(db, wid)
+    counts = badge_counts(db)
     return {
         "request": request,
         "user": user,
         "workshops": [
-            {"id": w.id, "name": w.name, "region": w.region, "badge": badges.get(w.name, 0)}
+            {
+                "id": w.id,
+                "name": w.name,
+                "region": w.region,
+                # 角标按主键取数，与过滤结果同一口径
+                "badge": counts.get(w.id, 0),
+            }
             for w in workshops
         ],
         "vats": [_vat_payload(v) for v in vats],
-        "filter_workshop": workshop_token,
+        "filter_workshop_id": wid,
         "selected_vat": selected_vat,
         "error": error,
+        "scope_warning": scope_warning,
         "status_labels": STATUS_LABELS,
         "active": "bay",
     }
@@ -145,15 +157,25 @@ async def bay_refresh(
 ):
     user = _need_login(request, db)
     if not user:
+        # 401 仅表示登录态失效；筛选错误绝不能复用这个码，否则前端会误判为掉登录
         return JSONResponse({"error": "login"}, status_code=401)
-    wid = resolve_workshop_id(db, workshop)
-    rows = vats_for_scope(db, wid, half=True)
+
+    # 与整页同一个范围解析入口：只认工坊主键，且下发该范围的完整缸位集
+    try:
+        wid = resolve_workshop_id(db, workshop)
+    except WorkshopScopeError as exc:
+        return JSONResponse(
+            {"error": "invalid_workshop", "message": str(exc)},
+            status_code=400,
+        )
+
+    rows = vats_for_scope(db, wid)
+    counts = badge_counts(db)
     return JSONResponse(
         {
-            "vats": [
-                {"id": v.id, "code": v.code, "workshopName": v.workshop.name if v.workshop else ""}
-                for v in rows
-            ]
+            "workshopId": wid,
+            "vats": [_vat_payload(v) for v in rows],
+            "badges": counts,
         }
     )
 
